@@ -1,0 +1,44 @@
+[paths]
+data_root = "input/mvtec_ad_2"
+model_dir = "artifacts/patchcore"
+public_maps_dir = "outputs/patchcore/test_public"
+private_maps_dir = "submissions/patchcore"
+
+[data]
+categories = [
+  "can",
+  "fabric",
+  "fruit_jelly",
+  "rice",
+  "sheet_metal",
+  "vial",
+  "wallplugs",
+  "walnuts",
+]
+include_validation_good = false
+private_splits = ["test_private", "test_private_mixed"]
+
+[model]
+backbone = "wide_resnet50_2"
+pretrained = true
+layers = ["layer2", "layer3"]
+image_size = 256
+batch_size = 8
+
+[patchcore]
+coreset_ratio = 0.1
+max_memory_patches = 50000
+search_chunk_size = 1024
+gaussian_sigma = 4.0
+
+[runtime]
+seed = 42
+num_workers = 2
+device = "auto"
+log_level = "INFO"
+
+[debug]
+enabled = false
+limit_train_images = 2
+limit_eval_images = 2
+limit_predict_images = 2
