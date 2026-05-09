@@ -15,3 +15,7 @@ wheels/
 artifacts/
 outputs/
 submissions/
+
+# Local VS Code CLI download artifacts
+/code
+/vscode_cli.tar.gz
