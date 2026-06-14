@@ -1,386 +1,463 @@
-from __future__ import annotations
-
-import argparse
-import json
-import logging
 import random
-from collections import OrderedDict
-from pathlib import Path
-
+from rouge_score import rouge_scorer
+from sklearn.model_selection import train_test_split
+import re
 import numpy as np
-import tifffile
+from transformers import (
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
+    DataCollatorForSeq2Seq,
+)
+from datasets import Dataset
+from pathlib import Path
 import torch
-import torch.nn.functional as F
-from PIL import Image
-from sklearn.metrics import precision_recall_curve, roc_auc_score
-from torch import nn
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms
-from torchvision.models import ResNet50_Weights, Wide_ResNet50_2_Weights, resnet50, wide_resnet50_2
-from torchvision.models.feature_extraction import create_feature_extractor
-from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import pandas as pd
 
 
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
-LOGGER = logging.getLogger(__name__)
+DATA_DIR = Path('input/')
+MODEL_NAME = 'facebook/nllb-200-distilled-600M'
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+MAX_INPUT_LENGTH  = 256    # Maximum tokens for input question
+MAX_OUTPUT_LENGTH = 512    # Maximum tokens for generated answer
+BATCH_SIZE_LLM    = 8      # Reduce to 4 if you get out-of-memory errors
+NUM_BEAMS         = 4      # Beam search width — higher = better quality, slower
+ID_COL           = 'ID'
+TEST_ID_COL      = 'ID'
+QUESTION_COL     = 'input'
+TEST_QUESTION_COL= 'input'
+ANSWER_COL       = 'output'
+LANG_COL         = 'subset'
+TEST_LANG_COL    = 'subset'
 
 
-class Config:
-    data_root = Path("input/mvtec_ad_2")
-    model_dir = Path("artifacts/patchcore")
-    public_maps_dir = Path("outputs/patchcore/test_public")
-    private_maps_dir = Path("submissions/patchcore")
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
 
-    categories = [
-        "can",
-        "fabric",
-        "fruit_jelly",
-        "rice",
-        "sheet_metal",
-        "vial",
-        "wallplugs",
-        "walnuts",
-    ]
-    include_validation_good = False
-    private_splits = ["test_private", "test_private_mixed"]
+TRAIN_PATH      = DATA_DIR / 'Train.csv'
+TEST_PATH       = DATA_DIR / 'Test.csv'
+VAL_PATH        = DATA_DIR / 'Val.csv'
+SAMPLE_SUB_PATH = DATA_DIR / 'SampleSubmission.csv'
 
-    backbone = "wide_resnet50_2"
-    pretrained = True
-    layers = ["layer2", "layer3"]
-    image_size = 256
-    batch_size = 8
+train             = pd.read_csv(TRAIN_PATH)
+test              = pd.read_csv(TEST_PATH)
+val               = pd.read_csv(VAL_PATH)
+sample_submission = pd.read_csv(SAMPLE_SUB_PATH)
 
-    coreset_ratio = 0.1
-    max_memory_patches = 50000
-    search_chunk_size = 1024
-    gaussian_sigma = 4.0
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# ── Load the model and tokeniser ───────────────────────────────────────────────
+print(f'Loading {MODEL_NAME}...')
+print('This may take a few minutes on first run (downloading model weights).')
 
-    seed = 42
-    num_workers = 2
-    device = "auto"
-    log_level = "INFO"
-
-    debug_enabled = False
-    limit_train_images = 2
-    limit_eval_images = 2
-    limit_predict_images = 2
-
-
-class ImagePathDataset(Dataset):
-    def __init__(self, paths, transform):
-        self.paths = paths
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, index):
-        path = self.paths[index]
-        with Image.open(path) as image:
-            original_size = image.size
-            tensor = self.transform(image.convert("RGB"))
-        return tensor, str(path), original_size
-
-
-class PatchFeatureExtractor(nn.Module):
-    def __init__(self, backbone, layers, pretrained):
-        super().__init__()
-        if layers != ["layer2", "layer3"]:
-            raise ValueError("This baseline currently expects layers = ['layer2', 'layer3'].")
-
-        if backbone == "wide_resnet50_2":
-            weights = Wide_ResNet50_2_Weights.DEFAULT if pretrained else None
-            model = wide_resnet50_2(weights=weights)
-        elif backbone == "resnet50":
-            weights = ResNet50_Weights.DEFAULT if pretrained else None
-            model = resnet50(weights=weights)
-        else:
-            raise ValueError(f"Unsupported backbone: {backbone}")
-
-        self.extractor = create_feature_extractor(model, return_nodes={layer: layer for layer in layers})
-
-    @torch.inference_mode()
-    def forward(self, x):
-        features: OrderedDict[str, torch.Tensor] = self.extractor(x)
-        layer2 = features["layer2"]
-        layer3 = F.interpolate(features["layer3"], size=layer2.shape[-2:], mode="bilinear", align_corners=False)
-        patches = torch.cat([layer2, layer3], dim=1)
-        return F.normalize(patches, p=2, dim=1)
-
-
-parser = argparse.ArgumentParser(description="Single-file PatchCore baseline.")
-parser.add_argument(
-    "mode",
-    nargs="?",
-    default="all",
-    choices=["train", "evaluate", "predict", "all"],
-    help="Run one stage or all stages in order.",
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model_llm = AutoModelForSeq2SeqLM.from_pretrained(
+    MODEL_NAME,
+    # Always load in float32 so gradient computation stays in float32.
+    # fp16/bf16 mixed precision is handled by the Trainer via grad scaler,
+    # not by storing the model weights in float16 directly.
+    torch_dtype = torch.float32,
 )
-args = parser.parse_args()
+model_llm = model_llm.to(DEVICE)
+model_llm.eval()
 
-data_root = Config.data_root
-model_dir = Config.model_dir
-public_maps_dir = Config.public_maps_dir
-private_maps_dir = Config.private_maps_dir
-categories = list(Config.categories)
-include_validation_good = Config.include_validation_good
-private_splits = list(Config.private_splits)
-backbone = Config.backbone
-pretrained = Config.pretrained
-layers = list(Config.layers)
-image_size = Config.image_size
-batch_size = Config.batch_size
-coreset_ratio = Config.coreset_ratio
-max_memory_patches = Config.max_memory_patches
-search_chunk_size = Config.search_chunk_size
-gaussian_sigma = Config.gaussian_sigma
-seed = Config.seed
-num_workers = Config.num_workers
-device_name = Config.device
-log_level = Config.log_level
-debug_enabled = Config.debug_enabled
-limit_train_images = Config.limit_train_images
-limit_eval_images = Config.limit_eval_images
-limit_predict_images = Config.limit_predict_images
+try:
 
-logging.basicConfig(
-    level=getattr(logging, log_level.upper(), logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-random.seed(seed)
-np.random.seed(seed)
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)
+    class WhitespaceTokenizer:
+        """Whitespace tokeniser — language-agnostic and safe for African scripts."""
+        def tokenize(self, text):
+            if text is None:
+                return []
+            return str(text).strip().split()
 
-if device_name == "auto":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-else:
-    device = torch.device(device_name)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("Config requested CUDA, but torch.cuda.is_available() is false.")
-LOGGER.info("Using device: %s", device)
+    def compute_rouge(predictions, references):
+        """
+        Compute mean ROUGE-1 and ROUGE-L F1 scores.
 
-transform = transforms.Compose(
-    [
-        transforms.Resize((image_size, image_size), antialias=True),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-    ]
-)
+        Parameters
+        ----------
+        predictions : list[str]
+        references  : list[str]
 
-if args.mode in {"train", "all"}:
-    if not 0 < coreset_ratio <= 1:
-        raise ValueError(f"coreset_ratio must be in (0, 1], got {coreset_ratio}")
+        Returns
+        -------
+        dict with rouge1_f1 and rougeL_f1
+        """
+        scorer = rouge_scorer.RougeScorer(
+            ['rouge1', 'rougeL'],
+            tokenizer    = WhitespaceTokenizer(),
+            use_stemmer  = False,
+        )
+        r1_scores, rl_scores = [], []
 
-    for category in categories:
-        root = data_root / category
-        train_dir = root / "train" / "good"
-        paths = sorted(p for p in train_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES) if train_dir.exists() else []
-        if include_validation_good:
-            val_dir = root / "validation" / "good"
-            paths.extend(sorted(p for p in val_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES) if val_dir.exists() else [])
-        paths = sorted(paths)
-        if not paths:
-            raise ValueError(f"{category}: no normal training images found.")
-        if debug_enabled and limit_train_images > 0:
-            paths = paths[:limit_train_images]
+        for pred, ref in zip(predictions, references):
+            score = scorer.score(str(ref), str(pred))
+            r1_scores.append(score['rouge1'].fmeasure)
+            rl_scores.append(score['rougeL'].fmeasure)
 
-        LOGGER.info("%s: training with %d normal images", category, len(paths))
-        loader = DataLoader(ImagePathDataset(paths, transform), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-        extractor = PatchFeatureExtractor(backbone, layers, pretrained)
-        extractor.eval().to(device)
-        chunks = []
-        grid_size = None
-        for images, _, _ in tqdm(loader, desc=f"{category}: extracting normal features"):
-            features = extractor(images.to(device, non_blocking=True))
-            grid_size = tuple(features.shape[-2:])
-            chunks.append(features.permute(0, 2, 3, 1).reshape(-1, features.shape[1]).cpu())
-        if not chunks:
-            raise RuntimeError(f"{category}: feature extraction produced an empty memory bank.")
-
-        memory = torch.cat(chunks, dim=0).float()
-        LOGGER.info("%s: raw memory bank shape=%s grid=%s", category, tuple(memory.shape), grid_size)
-        target = min(len(memory), max(1, int(len(memory) * coreset_ratio)), max_memory_patches)
-        if target < len(memory):
-            memory = memory[torch.randperm(len(memory))[:target]].contiguous()
-            LOGGER.info("Subsampled memory bank to %d patches", len(memory))
-        else:
-            memory = memory.contiguous()
-
-        category_dir = model_dir / category
-        category_dir.mkdir(parents=True, exist_ok=True)
-        torch.save({"memory_bank": memory}, category_dir / "memory_bank.pt")
-        metadata = {
-            "category": category,
-            "backbone": backbone,
-            "pretrained": pretrained,
-            "layers": layers,
-            "image_size": image_size,
-            "memory_bank_shape": list(memory.shape),
-            "coreset_ratio": coreset_ratio,
-            "max_memory_patches": max_memory_patches,
+        return {
+            'rouge1_f1': float(np.mean(r1_scores)) if r1_scores else 0.0,
+            'rougeL_f1': float(np.mean(rl_scores)) if rl_scores else 0.0,
         }
-        (category_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        LOGGER.info("%s: saved memory bank with shape=%s", category, tuple(memory.shape))
 
-if args.mode in {"evaluate", "all"}:
-    all_results = {}
-    for category in categories:
-        root = data_root / category
-        good_dir = root / "test_public" / "good"
-        bad_dir = root / "test_public" / "bad"
-        mask_dir = root / "test_public" / "ground_truth" / "bad"
-        samples = []
-        good_paths = sorted(p for p in good_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES) if good_dir.exists() else []
-        bad_paths = sorted(p for p in bad_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES) if bad_dir.exists() else []
-        samples.extend((p, 0, None) for p in good_paths)
-        for path in bad_paths:
-            mask_path = mask_dir / f"{path.stem}_mask.png"
-            if not mask_path.exists():
-                raise FileNotFoundError(f"Missing mask for {path}: expected {mask_path}")
-            samples.append((path, 1, mask_path))
-        if not samples:
-            raise ValueError(f"{category}: no public test images found.")
-        if debug_enabled:
-            good_samples = [s for s in samples if s[1] == 0]
-            bad_samples = [s for s in samples if s[1] == 1]
-            per_class_limit = max(1, limit_eval_images)
-            samples = good_samples[:per_class_limit] + bad_samples[:per_class_limit]
+    def compute_rouge_by_language(predictions, references, languages):
+        """Compute ROUGE scores broken down by language."""
+        results = {}
+        lang_arr = np.array(languages)
 
-        memory_path = model_dir / category / "memory_bank.pt"
-        if not memory_path.exists():
-            raise FileNotFoundError(f"Missing memory bank for {category}: {memory_path}")
-        memory_bank = torch.load(memory_path, map_location="cpu", weights_only=True)["memory_bank"].float().contiguous()
-        if memory_bank.ndim != 2:
-            raise ValueError(f"Invalid memory bank shape for {category}: {tuple(memory_bank.shape)}")
+        for lang in np.unique(lang_arr):
+            mask    = lang_arr == lang
+            preds_l = [p for p, m in zip(predictions, mask) if m]
+            refs_l  = [r for r, m in zip(references,  mask) if m]
+            results[lang] = compute_rouge(preds_l, refs_l)
 
-        paths = [sample[0] for sample in samples]
-        path_to_sample = {sample[0]: sample for sample in samples}
-        loader = DataLoader(ImagePathDataset(paths, transform), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-        extractor = PatchFeatureExtractor(backbone, layers, pretrained)
-        extractor.eval().to(device)
-        scores = []
-        masks_for_metrics = []
-        output_dir = public_maps_dir / category
+        return pd.DataFrame(results).T
 
-        for images, batch_paths, original_sizes in tqdm(loader, desc=f"{category}: scoring"):
-            features = extractor(images.to(device, non_blocking=True))
-            b, _, grid_h, grid_w = features.shape
-            flat = features.permute(0, 2, 3, 1).reshape(-1, features.shape[1])
-            memory_on_device = memory_bank.to(device)
-            patch_chunks = []
-            for chunk in flat.to(device).split(search_chunk_size):
-                patch_chunks.append(torch.cdist(chunk, memory_on_device, p=2).min(dim=1).values.cpu())
-            patch_scores = torch.cat(patch_chunks, dim=0).view(b, grid_h, grid_w)
-            widths = original_sizes[0].tolist() if torch.is_tensor(original_sizes[0]) else list(original_sizes[0])
-            heights = original_sizes[1].tolist() if torch.is_tensor(original_sizes[1]) else list(original_sizes[1])
+    print('✅ ROUGE scorer loaded')
 
-            for i in range(b):
-                score = patch_scores[i].view(1, 1, grid_h, grid_w).to(device)
-                if gaussian_sigma > 0:
-                    radius = max(1, int(3 * gaussian_sigma))
-                    coords = torch.arange(-radius, radius + 1, dtype=score.dtype, device=score.device)
-                    kernel = torch.exp(-(coords**2) / (2 * gaussian_sigma**2))
-                    kernel = kernel / kernel.sum()
-                    score = F.conv2d(F.pad(score, (radius, radius, 0, 0), mode="reflect"), kernel.view(1, 1, 1, -1))
-                    score = F.conv2d(F.pad(score, (0, 0, radius, radius), mode="reflect"), kernel.view(1, 1, -1, 1))
-                score = F.interpolate(score, size=(int(heights[i]), int(widths[i])), mode="bilinear", align_corners=False)
-                anomaly_map = score.squeeze().cpu().numpy().astype(np.float32)
-                path = Path(batch_paths[i])
-                output_path = output_dir / f"{path.stem}.tiff"
-                if not np.isfinite(anomaly_map).all():
-                    raise ValueError(f"Anomaly map contains non-finite values: {output_path}")
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                tifffile.imwrite(output_path, anomaly_map.astype(np.float16))
+except ImportError:
+    print('⚠️  rouge-score not installed. Run: pip install rouge-score')
+    compute_rouge = None
 
-                sample = path_to_sample[path]
-                if sample[2] is None:
-                    with Image.open(path) as image:
-                        width, height = image.size
-                    mask = np.zeros((height, width), dtype=np.uint8)
-                else:
-                    with Image.open(sample[2]) as mask_image:
-                        mask = (np.asarray(mask_image.convert("L")) > 0).astype(np.uint8)
-                scores.append(anomaly_map)
-                masks_for_metrics.append(mask)
+def make_submission(ids, predictions, output_path):
+    """
+    Build and save a valid Zindi submission file.
 
-        y_score = np.concatenate([s.reshape(-1).astype(np.float32) for s in scores])
-        y_true = np.concatenate([m.reshape(-1).astype(np.uint8) for m in masks_for_metrics])
-        if int(y_true.sum()) == 0 or int(len(y_true) - y_true.sum()) == 0:
-            raise ValueError("Pixel AUROC requires both positive and negative pixels.")
-        auroc = float(roc_auc_score(y_true, y_score))
-        precision, recall, thresholds = precision_recall_curve(y_true, y_score)
-        f1 = 2 * precision * recall / np.maximum(precision + recall, 1e-12)
-        best_index = int(np.nanargmax(f1))
-        threshold = float(thresholds[min(best_index, len(thresholds) - 1)]) if len(thresholds) else 0.0
-        pred = y_score >= threshold
-        intersection = float(np.logical_and(pred, y_true == 1).sum())
-        union = float(np.logical_or(pred, y_true == 1).sum())
-        all_results[category] = {
-            "pixel_auroc": auroc,
-            "best_f1": float(f1[best_index]),
-            "best_iou": intersection / max(union, 1.0),
-            "threshold": threshold,
-        }
-        LOGGER.info("%s: AUROC=%.5f F1=%.5f IoU=%.5f threshold=%.6f", category, auroc, all_results[category]["best_f1"], all_results[category]["best_iou"], threshold)
+    Parameters
+    ----------
+    ids         : array-like of row IDs
+    predictions : list[str] of generated answers
+    output_path : str or Path
+    """
+    # Belt-and-suspenders: strip any residual sentinel tokens before saving.
+    clean_preds = [re.sub(r'<extra_id_\d+>', '', str(p)).strip() for p in predictions]
 
-    public_maps_dir.mkdir(parents=True, exist_ok=True)
-    (public_maps_dir / "metrics.json").write_text(json.dumps(all_results, indent=2), encoding="utf-8")
-    LOGGER.info("Saved metrics to %s", public_maps_dir / "metrics.json")
+    sub = pd.DataFrame()
+    sub['ID']         = ids
+    sub['TargetRLF1'] = clean_preds
+    sub['TargetR1F1'] = clean_preds
+    sub['TargetLLM']  = clean_preds
 
-if args.mode in {"predict", "all"}:
-    for split in private_splits:
-        if split not in {"test_private", "test_private_mixed"}:
-            raise ValueError(f"Unsupported private split: {split}")
-        for category in categories:
-            root = data_root / category
-            split_dir = root / split
-            paths = sorted(p for p in split_dir.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES) if split_dir.exists() else []
-            if not paths:
-                raise ValueError(f"{category}: no images found for {split}")
-            if debug_enabled and limit_predict_images > 0:
-                paths = paths[:limit_predict_images]
+    sub = sub[['ID', 'TargetRLF1', 'TargetR1F1', 'TargetLLM']]
 
-            memory_path = model_dir / category / "memory_bank.pt"
-            if not memory_path.exists():
-                raise FileNotFoundError(f"Missing memory bank for {category}: {memory_path}")
-            memory_bank = torch.load(memory_path, map_location="cpu", weights_only=True)["memory_bank"].float().contiguous()
-            if memory_bank.ndim != 2:
-                raise ValueError(f"Invalid memory bank shape for {category}: {tuple(memory_bank.shape)}")
+    # ── Submission checks ─────────────────────────────────────────────────
+    required_cols = ['ID', 'TargetRLF1', 'TargetR1F1', 'TargetLLM']
+    assert list(sub.columns) == required_cols, \
+        f'Expected columns {required_cols}, got {list(sub.columns)}'
+    assert len(sub) == len(test), \
+        f'Row count mismatch: {len(sub)} predictions vs {len(test)} test rows'
+    assert sub[['TargetRLF1', 'TargetR1F1', 'TargetLLM']].notna().all().all(), \
+        'Missing values found in submission'
+    assert (sub['TargetRLF1'] == sub['TargetR1F1']).all(), \
+        'TargetRLF1 and TargetR1F1 differ'
+    assert (sub['TargetRLF1'] == sub['TargetLLM']).all(), \
+        'TargetRLF1 and TargetLLM differ'
 
-            loader = DataLoader(ImagePathDataset(paths, transform), batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
-            extractor = PatchFeatureExtractor(backbone, layers, pretrained)
-            extractor.eval().to(device)
-            output_dir = private_maps_dir / split / category
+    sub.to_csv(output_path, index=False, encoding='utf-8')
+    print(f'✅ Submission saved to: {output_path}')
+    print(f'   Shape : {sub.shape}')
+    return sub
 
-            for images, batch_paths, original_sizes in tqdm(loader, desc=f"{category}: scoring"):
-                features = extractor(images.to(device, non_blocking=True))
-                b, _, grid_h, grid_w = features.shape
-                flat = features.permute(0, 2, 3, 1).reshape(-1, features.shape[1])
-                memory_on_device = memory_bank.to(device)
-                patch_chunks = []
-                for chunk in flat.to(device).split(search_chunk_size):
-                    patch_chunks.append(torch.cdist(chunk, memory_on_device, p=2).min(dim=1).values.cpu())
-                patch_scores = torch.cat(patch_chunks, dim=0).view(b, grid_h, grid_w)
-                widths = original_sizes[0].tolist() if torch.is_tensor(original_sizes[0]) else list(original_sizes[0])
-                heights = original_sizes[1].tolist() if torch.is_tensor(original_sizes[1]) else list(original_sizes[1])
+print(f'✅ {MODEL_NAME} loaded on {DEVICE}')
+print(f'   Parameters : {sum(p.numel() for p in model_llm.parameters()) / 1e6:.0f}M')
 
-                for i in range(b):
-                    score = patch_scores[i].view(1, 1, grid_h, grid_w).to(device)
-                    if gaussian_sigma > 0:
-                        radius = max(1, int(3 * gaussian_sigma))
-                        coords = torch.arange(-radius, radius + 1, dtype=score.dtype, device=score.device)
-                        kernel = torch.exp(-(coords**2) / (2 * gaussian_sigma**2))
-                        kernel = kernel / kernel.sum()
-                        score = F.conv2d(F.pad(score, (radius, radius, 0, 0), mode="reflect"), kernel.view(1, 1, 1, -1))
-                        score = F.conv2d(F.pad(score, (0, 0, radius, radius), mode="reflect"), kernel.view(1, 1, -1, 1))
-                    score = F.interpolate(score, size=(int(heights[i]), int(widths[i])), mode="bilinear", align_corners=False)
-                    anomaly_map = score.squeeze().cpu().numpy().astype(np.float32)
-                    path = Path(batch_paths[i])
-                    output_path = output_dir / f"{path.stem}.tiff"
-                    if not np.isfinite(anomaly_map).all():
-                        raise ValueError(f"Anomaly map contains non-finite values: {output_path}")
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    tifffile.imwrite(output_path, anomaly_map.astype(np.float16))
-            LOGGER.info("%s/%s: wrote %d maps", split, category, len(paths))
+# ── Fine-tuning configuration ──────────────────────────────────────────────
+FINETUNE_OUTPUT_DIR     = './mt5-finetuned-health-qa'
+FINETUNE_EPOCHS         = 3
+FINETUNE_BATCH_SIZE     = 8      # Reduce to 4 if you hit OOM errors
+FINETUNE_LEARNING_RATE  = 5e-5
+FINETUNE_MAX_INPUT_LEN  = 256    # Must match MAX_INPUT_LENGTH used at inference
+FINETUNE_MAX_TARGET_LEN = 512    # Must match MAX_OUTPUT_LENGTH used at inference
+FINETUNE_VAL_SIZE       = 0.05   # 5% of training data used for validation
+
+OUTPUT_FINETUNED = DATA_DIR / 'submission_finetuned_llm.csv'
+
+print('Fine-tuning config:')
+print(f'  Model            : {MODEL_NAME}')
+print(f'  Epochs           : {FINETUNE_EPOCHS}')
+print(f'  Batch size       : {FINETUNE_BATCH_SIZE}')
+print(f'  Learning rate    : {FINETUNE_LEARNING_RATE}')
+print(f'  Max input tokens : {FINETUNE_MAX_INPUT_LEN}')
+print(f'  Max target tokens: {FINETUNE_MAX_TARGET_LEN}')
+print(f'  Val split        : {FINETUNE_VAL_SIZE:.0%}')
+print(f'  Output dir       : {FINETUNE_OUTPUT_DIR}')
+
+
+def build_prompt(question: str, language: str = None) -> str:
+    """
+    Build an input prompt for the model.
+
+    For mT5: prefix the question with a task description.
+    The model learns to associate the prefix with the generation task.
+
+    `language` may be a raw subset code (e.g. 'Amh_Eth') or a full language
+    name. It is resolved through `subset_to_language_name` so the model always
+    receives a human-readable language name in the prompt rather than an opaque
+    code.
+
+    Parameters
+    ----------
+    question : str
+        The health question to answer.
+    language : str, optional
+        Subset code (e.g. 'Amh_Eth') or full language name. Resolved to a
+        human-readable name before being inserted into the prompt.
+
+    Returns
+    -------
+    str
+    """
+    # if language:
+    #     lang_name = subset_to_language_name(language)
+    #     return f'Answer this health question in {lang_name}: {question}'
+    # return f'Answer this health question: {question}'
+    return str(question).strip()
+
+
+def generate_answers_batch(questions: list, languages: list = None,
+                           batch_size: int = BATCH_SIZE_LLM) -> list:
+    """
+    Generate answers for a list of questions using the loaded LLM.
+
+    Processes questions in batches to avoid out-of-memory errors.
+
+    Parameters
+    ----------
+    questions : list[str]
+    languages : list[str], optional
+    batch_size : int
+
+    Returns
+    -------
+    list[str]
+    """
+    if languages is None:
+        languages = [None] * len(questions)
+
+    all_answers = []
+    n_batches   = (len(questions) + batch_size - 1) // batch_size
+
+    for batch_idx in range(n_batches):
+        start = batch_idx * batch_size
+        end   = min(start + batch_size, len(questions))
+
+        batch_questions = questions[start:end]
+        batch_languages = languages[start:end]
+
+        # Build prompts
+        prompts = [
+            build_prompt(q, l)
+            for q, l in zip(batch_questions, batch_languages)
+        ]
+
+        # Tokenise
+        inputs = tokenizer(
+            prompts,
+            return_tensors = 'pt',
+            padding        = True,
+            truncation     = True,
+            max_length     = MAX_INPUT_LENGTH,
+        ).to(DEVICE)
+
+        # Generate
+        with torch.no_grad():
+            outputs = model_llm.generate(
+                **inputs,
+                max_new_tokens  = MAX_OUTPUT_LENGTH,
+                num_beams       = NUM_BEAMS,
+                early_stopping  = True,
+                no_repeat_ngram_size = 3,
+            )
+
+        # Decode
+        decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+        # Post-process: strip mT5 sentinel tokens (<extra_id_N>) that the
+        # model may emit when it has not been fine-tuned on a seq2seq task.
+        # mT5 is pre-trained with a span-corruption objective that uses these
+        # tokens as placeholders; a zero-shot prompt may trigger them because
+        # the model has never been trained to suppress them in open generation.
+        cleaned = [re.sub(r'<extra_id_\d+>', '', ans).strip() for ans in decoded]
+        all_answers.extend(cleaned)
+
+        if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == n_batches:
+            print(f'  Batch {batch_idx + 1}/{n_batches} — {end}/{len(questions)} questions processed')
+
+    return all_answers
+
+print('✅ LLM generation functions defined')
+
+
+# ── Build prompt-aware training dataset ───────────────────────────────────
+# Critical: we use build_prompt() here so training inputs match inference
+# inputs exactly. The language name (resolved from subset) is included so
+# the model learns to condition its output on the target language.
+
+def make_hf_dataset(df, question_col, answer_col, lang_col):
+    """
+    Convert a pandas DataFrame to a HuggingFace Dataset with prompt-formatted
+    inputs and tokenised labels.
+
+    Parameters
+    ----------
+    df           : pd.DataFrame
+    question_col : str  — column containing the question text
+    answer_col   : str  — column containing the reference answer
+    lang_col     : str  — column containing the subset code (e.g. 'Amh_Eth')
+
+    Returns
+    -------
+    datasets.Dataset with columns: input_ids, attention_mask, labels
+    """
+    records = []
+    for _, row in df.iterrows():
+        prompt = build_prompt(
+            question = str(row[question_col]),
+            language = str(row[lang_col]) if lang_col and lang_col in df.columns else None,
+        )
+        records.append({'prompt': prompt, 'answer': str(row[answer_col])})
+
+    raw_ds = Dataset.from_list(records)
+
+    def preprocess(examples):
+        # Tokenise inputs (prompts)
+        model_inputs = tokenizer(
+            examples['prompt'],
+            max_length  = FINETUNE_MAX_INPUT_LEN,
+            truncation  = True,
+            padding     = False,   # DataCollatorForSeq2Seq handles padding dynamically
+        )
+        # Tokenise targets (reference answers)
+        # Use text_target= (the modern API). The older context manager
+        # was removed in transformers >= 4.28 and must not be used.
+        labels = tokenizer(
+            text_target = examples['answer'],
+            max_length  = FINETUNE_MAX_TARGET_LEN,
+            truncation  = True,
+            padding     = False,
+        )
+        # Mask padding tokens in labels so the loss ignores them.
+        # Without this the model wastes capacity learning to predict pad tokens.
+        label_ids = labels['input_ids']
+        model_inputs['labels'] = [
+            [(tok if tok != tokenizer.pad_token_id else -100) for tok in seq]
+            for seq in label_ids
+        ]
+        return model_inputs
+
+    return raw_ds.map(preprocess, batched=True, remove_columns=['prompt', 'answer'])
+
+
+# ── Split off a validation set from training data ──────────────────────────
+
+
+train_df, val_ft_df = train_test_split(
+    train,
+    test_size    = FINETUNE_VAL_SIZE,
+    random_state = SEED,
+    stratify     = train[LANG_COL] if LANG_COL in train.columns else None,
+)
+
+print(f'Fine-tuning split — train: {len(train_df):,}  val: {len(val_ft_df):,}')
+
+hf_train_ds = make_hf_dataset(train_df,  QUESTION_COL, ANSWER_COL, LANG_COL)
+hf_val_ds   = make_hf_dataset(val_ft_df, QUESTION_COL, ANSWER_COL, LANG_COL)
+
+print(f'HF train dataset : {hf_train_ds}')
+print(f'HF val dataset   : {hf_val_ds}')
+
+# ── Data collator — handles dynamic padding and label masking ─────────────
+data_collator = DataCollatorForSeq2Seq(
+    tokenizer  = tokenizer,
+    model      = model_llm,
+    label_pad_token_id = -100,   # already set in preprocess, belt-and-suspenders
+    pad_to_multiple_of = 8,      # efficient on tensor cores
+)
+
+# ── Training arguments ─────────────────────────────────────────────────────
+training_args = Seq2SeqTrainingArguments(
+    output_dir                  = FINETUNE_OUTPUT_DIR,
+    num_train_epochs            = FINETUNE_EPOCHS,
+    per_device_train_batch_size = FINETUNE_BATCH_SIZE,
+    per_device_eval_batch_size  = FINETUNE_BATCH_SIZE,
+    learning_rate               = FINETUNE_LEARNING_RATE,
+    predict_with_generate       = True,
+    # bf16 is preferred over fp16 for seq2seq: it avoids the 'unscale FP16
+    # gradients' error that occurs when model weights are in float32 but the
+    # grad scaler tries to work in float16. bf16 is supported on Ampere+ GPUs
+    # (A100, RTX 30xx+). Falls back to no mixed precision on older hardware.
+    bf16                        = (DEVICE == 'cuda' and torch.cuda.is_bf16_supported()),
+    fp16                        = (DEVICE == 'cuda' and not torch.cuda.is_bf16_supported()),
+    eval_strategy               = 'epoch',              # validate after each epoch
+    save_strategy               = 'epoch',
+    load_best_model_at_end      = True,                 # restore best checkpoint
+    metric_for_best_model       = 'eval_loss',
+    logging_steps               = 100,
+    generation_max_length       = FINETUNE_MAX_TARGET_LEN,
+    report_to                   = 'none',               # disable W&B / MLflow
+)
+
+# ── Trainer ────────────────────────────────────────────────────────────────
+trainer = Seq2SeqTrainer(
+    model           = model_llm,
+    args            = training_args,
+    train_dataset   = hf_train_ds,
+    eval_dataset    = hf_val_ds,
+    processing_class = tokenizer,
+    data_collator   = data_collator,
+)
+
+print('Starting fine-tuning...')
+print(f'  Training on {len(hf_train_ds):,} examples for {FINETUNE_EPOCHS} epoch(s)')
+print(f'  Validating on {len(hf_val_ds):,} examples after each epoch')
+
+trainer.train()
+
+print('\n✅ Fine-tuning complete')
+print(f'   Best checkpoint saved to: {FINETUNE_OUTPUT_DIR}')
+
+# ── Regenerate test predictions with the fine-tuned model ─────────────────
+# model_llm now holds the best fine-tuned checkpoint (load_best_model_at_end=True).
+# We reuse generate_answers_batch() directly — it already uses model_llm
+# and applies the same build_prompt() + sentinel-token cleanup.
+
+print(f'Generating fine-tuned answers for {len(test):,} test questions...')
+model_llm.eval()
+
+test_questions_ft = test[TEST_QUESTION_COL].tolist()
+test_languages_ft = test[TEST_LANG_COL].tolist() if TEST_LANG_COL else None
+
+test_pred_finetuned = generate_answers_batch(test_questions_ft, test_languages_ft)
+
+print(f'\n✅ Generated {len(test_pred_finetuned):,} answers')
+
+# Preview
+preview_ft = test[[TEST_ID_COL, TEST_QUESTION_COL]].copy()
+preview_ft['finetuned_answer'] = test_pred_finetuned
+
+# ── Validate on val set before saving ─────────────────────────────────────
+if compute_rouge:
+    val_q_ft  = val[QUESTION_COL].tolist()
+    val_l_ft  = val[LANG_COL].tolist() if LANG_COL else None
+    val_ref_ft = val[ANSWER_COL].tolist()
+
+    val_pred_ft = generate_answers_batch(val_q_ft, val_l_ft)
+    metrics_ft  = compute_rouge(val_pred_ft, val_ref_ft)
+
+    print('\n📊 Fine-tuned LLM — Validation ROUGE Scores')
+    print(f'   ROUGE-1 F1 : {metrics_ft["rouge1_f1"]:.4f}')
+    print(f'   ROUGE-L F1 : {metrics_ft["rougeL_f1"]:.4f}')
+
+    if LANG_COL and LANG_COL in val.columns:
+        print('\n📊 ROUGE scores by language (fine-tuned model):')
+        lang_metrics_ft = compute_rouge_by_language(
+            val_pred_ft, val_ref_ft, val[LANG_COL].tolist()
+        )
+
+# ── Save fine-tuned submission ─────────────────────────────────────────────
+print('\nSaving fine-tuned submission...')
+sub_finetuned = make_submission(
+    ids         = test[TEST_ID_COL].values,
+    predictions = test_pred_finetuned,
+    output_path = OUTPUT_FINETUNED,
+)
